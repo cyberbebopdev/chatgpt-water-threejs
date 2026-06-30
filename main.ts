@@ -133,7 +133,7 @@ pmremGenerator.compileEquirectangularShader();
 
 // Generate the PMREM texture from our procedural sky scene.
 // The result is a CubeTexture with a prefiltered mip chain.
-const envMap: THREE.CubeTexture = pmremGenerator.fromScene(skyScene).texture;
+const envMap = pmremGenerator.fromScene(skyScene).texture;
 
 // Generate the irradiance map for diffuse environment lighting.
 // PMREMGenerator stores the irradiance map internally after fromScene().
@@ -160,6 +160,13 @@ scene.environment = envMap;
 // Ocean mesh
 // ---------------------------------------------------------------------------
 
+const shorelineFoamSources = [[35, -18, 28, 10]];
+const objectFoamSources = [
+  [-35, 15, 4, 6],
+  [-22, 30, 3, 5],
+  [16, -42, 5, 7],
+];
+
 const water = new WaterMesh({
   size: 1000,
   segments: 256,
@@ -171,11 +178,108 @@ const water = new WaterMesh({
   deepColor: [0.0, 0.05, 0.15],
   shallowColor: [0.0, 0.5, 0.6],
   foamColor: [0.95, 0.95, 0.95],
-  foamThreshold: 2.5,
+  foamSteepnessThreshold: 0.3,
+  shorelineFoamSources,
+  objectFoamSources,
   sssColor: [0.0, 0.35, 0.45],
   sssScale: 8.0,
 });
 scene.add(water);
+
+const debugModeNames = [
+  'final',
+  'water-no-foam',
+  'normal',
+  'elevation',
+  'steepness',
+  'crest-foam',
+  'shoreline-foam',
+  'object-foam',
+  'final-foam',
+];
+
+let activeDebugMode = 1;
+water.setDebugMode(activeDebugMode);
+
+const debugPanel = document.createElement('div');
+debugPanel.style.position = 'fixed';
+debugPanel.style.left = '12px';
+debugPanel.style.top = '12px';
+debugPanel.style.zIndex = '10';
+debugPanel.style.display = 'grid';
+debugPanel.style.gridTemplateColumns = 'repeat(3, max-content)';
+debugPanel.style.gap = '6px';
+debugPanel.style.padding = '8px';
+debugPanel.style.background = 'rgba(0, 0, 0, 0.62)';
+debugPanel.style.color = '#fff';
+debugPanel.style.font = '12px system-ui, sans-serif';
+debugPanel.style.border = '1px solid rgba(255, 255, 255, 0.22)';
+document.body.appendChild(debugPanel);
+
+const debugLabel = document.createElement('div');
+debugLabel.style.gridColumn = '1 / -1';
+debugPanel.appendChild(debugLabel);
+
+function setDebugMode(mode: number): void {
+  activeDebugMode = mode;
+  water.setDebugMode(mode);
+  debugLabel.textContent = `Debug ${mode}: ${debugModeNames[mode]}`;
+
+  debugPanel.querySelectorAll('button').forEach((button, index) => {
+    button.style.background = index === mode ? '#fff' : 'rgba(255,255,255,0.12)';
+    button.style.color = index === mode ? '#000' : '#fff';
+  });
+}
+
+debugModeNames.forEach((name, mode) => {
+  const button = document.createElement('button');
+  button.textContent = `${mode} ${name}`;
+  button.style.border = '1px solid rgba(255,255,255,0.35)';
+  button.style.padding = '5px 7px';
+  button.style.cursor = 'pointer';
+  button.onclick = () => setDebugMode(mode);
+  debugPanel.appendChild(button);
+});
+
+setDebugMode(activeDebugMode);
+
+window.addEventListener('keydown', (event) => {
+  const mode = Number(event.key);
+  if (!Number.isInteger(mode) || mode < 0 || mode >= debugModeNames.length) {
+    return;
+  }
+
+  setDebugMode(mode);
+});
+
+const sandMaterial = new THREE.MeshStandardMaterial({
+  color: 0xb99b6b,
+  roughness: 0.9,
+  metalness: 0.0,
+});
+
+const island = new THREE.Mesh(
+  new THREE.CylinderGeometry(28, 34, 5, 96),
+  sandMaterial
+);
+island.position.set(35, -2.5, -18);
+scene.add(island);
+
+const rockMaterial = new THREE.MeshStandardMaterial({
+  color: 0x3e4345,
+  roughness: 0.75,
+  metalness: 0.0,
+});
+
+objectFoamSources.forEach(([x, z, radius], index) => {
+  const rock = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius * 0.75, radius, 12 + index * 2, 18),
+    rockMaterial
+  );
+  rock.position.set(x, 2.5, z);
+  rock.rotation.z = (index - 1) * 0.12;
+  scene.add(rock);
+});
 
 // ---------------------------------------------------------------------------
 // Orbit controls

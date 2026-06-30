@@ -5,6 +5,7 @@ import {
   ShaderMaterial,
   Mesh,
   Vector3,
+  Vector4,
   Texture,
 } from 'three';
 
@@ -87,15 +88,71 @@ export interface WaterMeshConfig {
    */
   shallowColor?: [number, number, number];
 
+  // ── Foam parameters ───────────────────────────────────────────────────
+
   /**
    * Foam colour applied at wave crests.
    */
   foamColor?: [number, number, number];
 
   /**
-   * Threshold (in elevation space) above which foam appears.
+   * Minimum wave gradient magnitude (steepness) required for foam.
+   * Lower values produce more foam across gentler waves.
+   * Typical range: 0.1 – 0.8.
    */
-  foamThreshold?: number;
+  foamSteepnessThreshold?: number;
+
+  /**
+   * How sharply foam transitions from 0 to 1 based on steepness.
+   * Higher = crisper foam edges.  Typical range: 2 – 20.
+   */
+  foamSteepnessSharpness?: number;
+
+  /**
+   * Distance from the mesh edge where shoreline foam appears (meters).
+   * Set to 0 to disable shoreline foam.
+   */
+  shorelineFoamWidth?: number;
+
+  /**
+   * Opacity of shoreline foam (0 = none, 1 = full).
+   */
+  shorelineFoamOpacity?: number;
+
+  /**
+   * Circular shoreline distance fields.
+   * Each entry: [x, z, radius, foamWidth].
+   * Useful for islands/sandbars before a full depth buffer is available.
+   */
+  shorelineFoamSources?: number[][];
+
+  /**
+   * Positions of objects that break the water surface.
+   * Foam accumulates around each position.
+   * Each entry: [x, z, radius, foamWidth].
+   *   - x, z: world-space position on the water plane
+   *   - radius: object's effective radius at the water surface
+   *   - foamWidth: how far foam spreads outward from the object
+   */
+  objectFoamSources?: number[][];
+
+  /**
+   * Seed for the procedural noise that modulates foam distribution.
+   * Different values produce different foam patterns.
+   */
+  foamNoiseSeed?: number;
+
+  /**
+   * Frequency of the noise that breaks up foam organically.
+   * Higher = more scattered, broken-up foam.
+   */
+  foamNoiseFrequency?: number;
+
+  /**
+   * Maximum foam opacity.  Even at full steepness, foam will not
+   * exceed this value.  Typical range: 0.3 – 0.9.
+   */
+  foamMaxOpacity?: number;
 
   /**
    * Subsurface scattering approximation colour.
@@ -118,7 +175,13 @@ const defaultConfig: WaterMeshConfig = {
   deepColor: [0.0, 0.05, 0.15],
   shallowColor: [0.0, 0.5, 0.6],
   foamColor: [0.95, 0.95, 0.95],
-  foamThreshold: 2.5,
+  foamSteepnessThreshold: 0.3,
+  foamSteepnessSharpness: 8.0,
+  shorelineFoamWidth: 8.0,
+  shorelineFoamOpacity: 0.6,
+  foamNoiseSeed: 42.0,
+  foamNoiseFrequency: 3.0,
+  foamMaxOpacity: 0.7,
   sssColor: [0.0, 0.35, 0.45],
   sssScale: 8.0,
   waves: [
@@ -151,6 +214,8 @@ const defaultConfig: WaterMeshConfig = {
 // ---------------------------------------------------------------------------
 
 const MAX_WAVES = 8;
+const MAX_FOAM_SOURCES = 8;
+const MAX_SHORELINE_SOURCES = 8;
 
 // ---------------------------------------------------------------------------
 // Vertex shader
@@ -175,6 +240,12 @@ const MAX_WAVES = 8;
 //
 //   Normal = normalize( cross( ∂P/∂x₀ , ∂P/∂z₀ ) )
 //
+//   Wave gradient magnitude (for foam):
+//     |∇y| = sqrt( (∂y/∂x₀)² + (∂y/∂z₀)² )
+//         = sqrt( (-A*k*dₓ*sinφ)² + (-A*k*d_z*sinφ)² )
+//         = A * k * |sin(φ)|  * sqrt(dₓ² + d_z²)
+//         = A * k * |sin(φ)|    (since d is a unit vector)
+//
 // Multiple layers are accumulated: displacement sums, and tangent
 // components sum analytically (chain rule through the shared original
 // position p₀).  No numerical finite-difference approximations.
@@ -189,10 +260,15 @@ const vertexShader = /* glsl */ `
   uniform float uSpeed[${MAX_WAVES}];
   uniform vec2  uDirection[${MAX_WAVES}];
   uniform float uSteepness[${MAX_WAVES}];
+  uniform float uMaxWaveHeight;
 
   varying vec3 vWorldPosition;
   varying vec3 vNormal;
   varying float vElevation;
+
+  // Wave gradient magnitude for foam computation.
+  // |∇y| = length(sum over all wave height derivatives)
+  varying float vWaveGradient;
 
   void main() {
     vec3 p = position;                  // original vertex (y ≈ 0)
@@ -203,6 +279,7 @@ const vertexShader = /* glsl */ `
     vec3 tz = vec3(0.0, 0.0, 1.0);     // ∂P/∂z₀
 
     vec3 disp = vec3(0.0);
+    vec2 grad = vec2(0.0);              // ∇y accumulator
 
     for (int i = 0; i < ${MAX_WAVES}; i++) {
       if (i >= uWaveCount) break;
@@ -226,7 +303,6 @@ const vertexShader = /* glsl */ `
       disp.z += -A * q * sp * d.y;
 
       // -- Analytical tangent contributions -------------------------------
-      // ∂φ/∂x₀ = k * d.x ,  ∂φ/∂z₀ = k * d.y  (d.y is dz)
       float aqk = A * q * k;
 
       tx.x += -aqk * d.x * d.x * cp;
@@ -236,16 +312,22 @@ const vertexShader = /* glsl */ `
       tz.x += -aqk * d.x * d.y * cp;
       tz.y += -A * k * d.y * sp;
       tz.z += -aqk * d.y * d.y * cp;
+
+      // -- Gradient magnitude for foam ------------------------------------
+      // ∂y/∂x₀ = -A * k * dₓ * sin(φ)
+      // ∂y/∂z₀ = -A * k * d_z * sin(φ)
+      grad += -A * k * sp * d;
     }
 
     vec3 pos = p + disp;
 
     // Analytical normal from cross product of tangent vectors
-    vec3 normal = normalize(cross(tx, tz));
+    vec3 normal = normalize(cross(tz, tx));
 
     vWorldPosition = (modelMatrix * vec4(pos, 1.0)).xyz;
     vNormal = normalize(normalMatrix * normal);
     vElevation = disp.y;
+    vWaveGradient = length(grad);
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
   }
@@ -267,7 +349,7 @@ const vertexShader = /* glsl */ `
 //   7. BRDF integration for rough env maps     — precomputed or analytical
 //   8. Fresnel-weighted irradiance              — diffuse environment lighting
 //   9. Subsurface scattering approximation      — light penetration effect
-//  10. Foam / whitecaps at crests               — elevation-based foam
+//  10. Procedural foam                          — steepness + shoreline + objects
 //  11. ACES filmic tone mapping                  — cinematic HDR→LDR curve
 //  12. Depth-based colour falloff               — clear → deep gradient
 //
@@ -569,13 +651,126 @@ const vertexShader = /* glsl */ `
 // Phase One's Tone Reproduction Preview."
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EQUATION 11 — Procedural Foam Generation
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// Foam is computed from four independent factors, each producing a value
+// in [0, 1].  The final foam alpha is the maximum of all factors,
+// modulated by procedural noise for organic breakup.
+//
+// ━─ Factor 1: Wave Steepness (crest foam) ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// Foam forms at wave crests where the surface gradient is steepest.
+// The vertical gradient magnitude |∇y| is computed analytically in the
+// vertex shader:
+//
+//   For a single Gerstner wave with displacement y = A·cos(φ):
+//
+//     ∂y/∂x₀ = -A · k · dₓ · sin(φ)
+//     ∂y/∂z₀ = -A · k · d_z · sin(φ)
+//
+//   The gradient magnitude for this wave:
+//
+//     |∇y|_i = sqrt( (∂y/∂x₀)² + (∂y/∂z₀)² )
+//            = A · k · |sin(φ)| · sqrt(dₓ² + d_z²)
+//            = A · k · |sin(φ)|          (since d is unit length)
+//
+//   For N superimposed waves, we sum the absolute contributions:
+//
+//     |∇y| = Σᵢ Aᵢ · kᵢ · |sin(φᵢ)|
+//
+//   This gives a scalar that peaks at wave crests (where |sin(φ)| ≈ 1)
+//   and drops to zero at troughs (where |sin(φ)| ≈ 0).
+//
+//   The foam contribution from steepness:
+//
+//     foam_steep = smoothstep(threshold, threshold + 1/sharpness, |∇y|)
+//
+//   The smoothstep ensures foam only appears when the gradient exceeds
+//   a threshold, with a sharp transition controlled by the sharpness
+//   parameter.
+//
+// ━─ Factor 2: Crest Elevation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// Foam also correlates with elevation: the highest points of compound
+// waves (where multiple crests align) are most likely to break.
+//
+//   foam_crest = smoothstep(crestMin, crestMax, elevation)
+//
+//   We use a high threshold so only the top ~10% of wave heights
+//   produce foam.  This is combined multiplicatively with steepness
+//   so foam only appears at HIGH AND STEEP locations.
+//
+// ━─ Factor 3: Shoreline Foam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// When waves approach a shore (the edge of the mesh), they break and
+// create a band of white foam.  We compute the distance from the mesh
+// boundary:
+//
+//     halfSize = mesh_size / 2
+//     distX = halfSize - |worldX|
+//     distZ = halfSize - |worldZ|
+//     distEdge = min(distX, distZ)
+//
+//   Foam appears when distEdge < shorelineFoamWidth:
+//
+//     foam_shore = 1.0 - smoothstep(0.0, shorelineFoamWidth, distEdge)
+//
+//   This creates a smooth band of foam along all four edges of the
+//   mesh, fading to zero as you move inland.
+//
+// ━─ Factor 4: Object Intersection Foam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// When waves hit an object (a pier, a boat, a rock), foam accumulates
+// around the base.  For each foam source at position (ox, oz) with
+// radius r and foam spread width w:
+//
+//     d = sqrt( (worldX - ox)² + (worldZ - oz)² )
+//     foam_obj_i = 1.0 - smoothstep(r, r + w, d)
+//
+//   This creates a ring of foam just outside the object boundary,
+//   fading to zero at distance r + w.
+//
+//   Multiple sources are combined with max():
+//
+//     foam_object = max_i(foam_obj_i)
+//
+// ━─ Noise Modulation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// Raw foam from the factors above is too uniform.  Real foam has an
+// organic, broken-up appearance.  We use a hash-based noise function
+// to create spatial variation:
+//
+//     noise = hash2D(worldXZ * noiseFrequency + noiseSeed)
+//
+//   The noise value in [0, 1] is used to attenuate foam:
+//
+//     foam_final = foam_base * (0.5 + 0.5 * noise)
+//
+//   This ensures foam is never completely eliminated (minimum 0.5x)
+//   but can be doubled in noisy regions, creating a scattered pattern.
+//
+// ━─ Final Foam Composition ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+//   foam_base = max( foam_steep * foam_crest,  foam_shore,  foam_object )
+//   foam_final = clamp( foam_base * noise_modulation, 0, foamMaxOpacity )
+//
+//   The final colour blends between the water colour and foam colour:
+//
+//     color = mix(waterColor, foamColor, foam_final)
+//
+//   Using mix() ensures foam replaces the water colour rather than
+//   adding to it, which would break energy conservation.
 
 const fragmentShader = /* glsl */ `
   precision highp float;
 
+  uniform float uTime;
+
   varying vec3 vWorldPosition;
   varying vec3 vNormal;
   varying float vElevation;
+  varying float vWaveGradient;
 
   // ── PBR uniforms ──────────────────────────────────────────────────────
   uniform float uRoughness;
@@ -586,25 +781,94 @@ const fragmentShader = /* glsl */ `
   uniform samplerCube uEnvMap;    // PMREM-processed environment map
   uniform samplerCube uIrradianceMap;  // irradiance for diffuse env
   uniform sampler2D uBRDFLUT;     // precomputed BRDF lookup (optional)
+  uniform int uDebugMode;
 
   // ── Water appearance uniforms ─────────────────────────────────────────
   uniform vec3  uDeepColor;
   uniform vec3  uShallowColor;
   uniform vec3  uFoamColor;
-  uniform float uFoamThreshold;
   uniform vec3  uSSSColor;
   uniform float uSSSScale;
+
+  // ── Foam uniforms ─────────────────────────────────────────────────────
+  uniform float uFoamSteepnessThreshold;
+  uniform float uFoamSteepnessSharpness;
+  uniform float uShorelineFoamWidth;
+  uniform float uShorelineFoamOpacity;
+  uniform float uFoamNoiseSeed;
+  uniform float uFoamNoiseFrequency;
+  uniform float uFoamMaxOpacity;
+  uniform float uMeshHalfSize;
+  uniform float uMaxWaveHeight;
+  uniform int   uShorelineSourceCount;
+  uniform vec4  uShorelineSources[${MAX_SHORELINE_SOURCES}];  // (x, z, radius, foamWidth)
+  uniform int   uFoamSourceCount;
+  uniform vec4  uFoamSources[${MAX_FOAM_SOURCES}];  // (x, z, radius, foamWidth)
 
   // ── Constants ─────────────────────────────────────────────────────────
   const float PI = 3.141592653589793;
 
   // ───────────────────────────────────────────────────────────────────────
+  // Hash / Noise functions for organic foam breakup
+  // ───────────────────────────────────────────────────────────────────────
+
+  // 2D hash function — produces a pseudo-random value in [0, 1]
+  // based on the input coordinates.  Uses a simple Sobol-style hash.
+  float hash2D(vec2 co) {
+    return fract(sin(dot(co, vec2(127.1, 311.7))) * 43758.5453);
+  }
+
+  // Value noise with multiple octaves for natural-looking foam patterns.
+  // Returns a value in [0, 1].
+  float foamNoise(vec2 uv) {
+    vec2 i = floor(uv);
+    vec2 f = fract(uv);
+
+    // Smoothstep interpolation for C1 continuity
+    vec2 u = f * f * (3.0 - 2.0 * f);
+
+    // Sample the hash at the four corners and interpolate
+    float a = hash2D(i);
+    float b = hash2D(i + vec2(1.0, 0.0));
+    float c = hash2D(i + vec2(0.0, 1.0));
+    float d = hash2D(i + vec2(1.0, 1.0));
+
+    return mix(
+      mix(a, b, u.x),
+      mix(c, d, u.x),
+      u.y
+    );
+  }
+
+  float foamFBM(vec2 uv) {
+    float value = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+
+    for (int i = 0; i < 4; i++) {
+      value += amp * foamNoise(uv * freq);
+      freq *= 2.03;
+      amp *= 0.5;
+    }
+
+    return value;
+  }
+
+  float circularBand(vec2 p, vec2 center, float radius, float width) {
+    float d = distance(p, center);
+    float insideFade = smoothstep(radius - width * 0.35, radius, d);
+    float outsideFade = 1.0 - smoothstep(radius, radius + width, d);
+    return insideFade * outsideFade;
+  }
+
+  vec3 tonemapACES(vec3 color) {
+    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    return pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
   // EQUATION 1: Schlick Fresnel Approximation
   // F(θ) = F₀ + (1 − F₀) · (1 − cos θ)⁵
-  //
-  // cosTheta is the dot product between the half-vector H and the view
-  // direction V for specular, or N·V for diffuse Fresnel.
-  // The power-5 term ensures F → 1 at grazing angles.
   // ───────────────────────────────────────────────────────────────────────
   vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
@@ -613,9 +877,6 @@ const fragmentShader = /* glsl */ `
   // ───────────────────────────────────────────────────────────────────────
   // EQUATION 2: GGX / Trowbridge-Reitz Normal Distribution Function
   // D = α² / ( π · ( (N·H)² · (α² − 1) + 1 )² )
-  //
-  // α = roughness² gives perceptually linear control.
-  // The denominator's squared term creates the characteristic GGX tail.
   // ───────────────────────────────────────────────────────────────────────
   float distributionGGX(float NdotH, float roughness) {
     float a   = roughness * roughness;
@@ -629,9 +890,6 @@ const fragmentShader = /* glsl */ `
   // G₁(X) =  (X·N) / ( (X·N) · (1 − k) + k )
   // k = roughness² / (2 · (roughness + 1)²)
   // G  =  G₁(V) · G₁(L)
-  //
-  // This estimates the fraction of microfacets visible from both the
-  // light and the camera simultaneously.
   // ───────────────────────────────────────────────────────────────────────
   float geometrySchlickGGX(float NdotX, float roughness) {
     float r = roughness + 1.0;
@@ -646,14 +904,8 @@ const fragmentShader = /* glsl */ `
 
   // ───────────────────────────────────────────────────────────────────────
   // EQUATION 7: BRDF Integration (analytical fallback)
-  // When no BRDF LUT is available, use the closed-form approximation:
-  //   perceptualRoughness = (1 − N·V)⁵
-  //   scale = perceptualRoughness · (1 − F₀)
-  //   integral = F₀
   // ───────────────────────────────────────────────────────────────────────
   vec3 brdfIntegrationAnalytical(float NdotV, vec3 F0) {
-    // The (1-NdotV)^5 term approximates the precomputed BRDF scale.
-    // At NdotV=1 (straight on), scale=0.  At NdotV=0 (grazing), scale=1.
     float perceptualRoughness = pow(1.0 - NdotV, 5.0);
     return perceptualRoughness * (1.0 - F0) + F0;
   }
@@ -661,6 +913,23 @@ const fragmentShader = /* glsl */ `
   void main() {
     // ── Surface normal (analytical Gerstner) ────────────────────────────
     vec3 N = normalize(vNormal);
+
+    if (uDebugMode == 2) {
+      gl_FragColor = vec4(N * 0.5 + 0.5, 1.0);
+      return;
+    }
+
+    if (uDebugMode == 3) {
+      float e = clamp(vElevation / max(uMaxWaveHeight, 0.001) * 0.5 + 0.5, 0.0, 1.0);
+      gl_FragColor = vec4(vec3(e), 1.0);
+      return;
+    }
+
+    if (uDebugMode == 4) {
+      float s = clamp(vWaveGradient / max(uFoamSteepnessThreshold * 2.0, 0.001), 0.0, 1.0);
+      gl_FragColor = vec4(vec3(s), 1.0);
+      return;
+    }
 
     // ── View direction ──────────────────────────────────────────────────
     vec3 V = normalize(cameraPosition - vWorldPosition);
@@ -675,9 +944,6 @@ const fragmentShader = /* glsl */ `
     float HdotV = max(dot(H, V), 0.0);
 
     // ── EQUATION 1: Fresnel (Schlick) ───────────────────────────────────
-    // F₀ is the reflectance at normal incidence.  For water with IOR 1.33:
-    //   F₀ = ((1.33 − 1) / (1.33 + 1))² ≈ 0.023
-    // We pass it as a uniform so the caller can tweak it.
     vec3 F = fresnelSchlick(HdotV, uF0);
 
     // ── EQUATION 2: Normal Distribution Function (GGX) ──────────────────
@@ -687,79 +953,176 @@ const fragmentShader = /* glsl */ `
     float G = geometrySmith(NdotV, NdotL, uRoughness);
 
     // ── EQUATION 4: Cook-Torrance specular BRDF ─────────────────────────
-    // kₛ = (D · G · F) / (4 · NdotV · NdotL)
-    vec3 kSpec = (D * G * F) / (4.0 * NdotV * NdotL);
+    vec3 kSpec = vec3(0.0);
+    if (NdotL > 0.0) {
+      float specDenom = max(4.0 * NdotV * NdotL, 0.001);
+      kSpec = (D * G * F) / specDenom;
+    }
 
     // ── EQUATION 5: Diffuse albedo with energy conservation ─────────────
-    // Deep water → crest gradient
     float t = smoothstep(-4.0, 4.0, vElevation);
     vec3 albedo = mix(uDeepColor, uShallowColor, t);
-
-    // kₔ = (1 − F) · (1 − metalness) · albedo / π
-    // For water (metalness = 0) the full (1 − F) fraction is diffuse.
     vec3 kDiff = (1.0 - F) * (1.0 - uMetalness) * albedo / PI;
 
     // ── Direct lighting ─────────────────────────────────────────────────
-    // Lo = (kₛ + kₔ) · Li · (N·L)
     vec3 directLighting = (kSpec + kDiff) * uLightColor * NdotL;
 
     // ── EQUATION 6: Environment map reflection (prefiltered) ────────────
-    // R = reflect(−V, N)  =  −V + 2·(N·V)·N
     vec3 R = reflect(-V, N);
-
-    // PMREM stores prefiltered lobes in the mip chain.  The lod value
-    // maps roughness ∈ [0, 1] to the mip range [0, maxMip].
     float envMapRoughness = uRoughness;
     vec3 envColor = textureLod(uEnvMap, R, envMapRoughness * 4.0).rgb;
 
     // ── EQUATION 7: BRDF Integration ────────────────────────────────────
-    // Scale the environment reflection by the precomputed/analytical BRDF.
-    // This ensures energy conservation for rough surfaces.
     vec3 brdfFactor;
     #ifdef USE_BRDF_LUT
-      // Use the 2D BRDF lookup texture if available.
-      // x-axis: NdotV  y-axis: roughness
       vec2 brdfUV = vec2(NdotV, uRoughness);
-      brdfFactor = texture(uBRDFLUT, brdfUV).rg * F0 + F0;
+      vec2 brdf = texture(uBRDFLUT, brdfUV).rg;
+      brdfFactor = uF0 * brdf.x + brdf.y;
     #else
-      // Analytical approximation (no texture needed)
       brdfFactor = brdfIntegrationAnalytical(NdotV, uF0);
     #endif
 
     vec3 envSpecular = envColor * brdfFactor;
 
     // ── EQUATION 8: Fresnel-weighted irradiance (diffuse env) ───────────
-    // The diffuse environment contribution uses the irradiance map,
-    // weighted by (1 − F) to ensure energy conservation.
     vec3 irradiance = texture(uIrradianceMap, N).rgb;
     vec3 F_diffuse = fresnelSchlick(NdotV, uF0);
     vec3 envDiffuse = (1.0 - F_diffuse) * irradiance * albedo;
 
     // ── EQUATION 9: Subsurface scattering approximation ─────────────────
-    // SSS = sssColor · max(0, dot(V, tangent)) · (1-F) · wrapLight
-    // Creates a rim-lighting effect along wave crests.
-    vec3 T = normalize(V - N * dot(V, N));  // tangent perpendicular to V and N
-    float wrapLight = max(0.0, dot(N, L) * 0.5 + 0.5);  // wrapped diffuse
+    vec3 T = normalize(V - N * dot(V, N));
+    float wrapLight = max(0.0, dot(N, L) * 0.5 + 0.5);
     float sss = max(0.0, dot(V, T)) * (1.0 - F_diffuse.r) * wrapLight;
-    vec3 sssContribution = uSSSColor * sss * 0.5;
+    vec3 sssContribution = uSSSColor * sss * uSSSScale * 0.0625;
 
-    // ── Foam / whitecaps at wave crests ─────────────────────────────────
-    // Foam appears when elevation exceeds the threshold.
-    float foam = smoothstep(uFoamThreshold, uFoamThreshold + 1.5, vElevation);
-    vec3 foamContribution = uFoamColor * foam * 0.3;
+    // ── Combine water contributions (before foam) ───────────────────────
+    vec3 waterColor = directLighting + envSpecular + envDiffuse + sssContribution;
 
-    // ── Combine all contributions ───────────────────────────────────────
-    vec3 color = directLighting + envSpecular + envDiffuse + sssContribution + foamContribution;
+    if (uDebugMode == 1) {
+      gl_FragColor = vec4(tonemapACES(waterColor), 1.0);
+      return;
+    }
 
-    // ── EQUATION 10: ACES Filmic Tone Mapping ──────────────────────────
-    // Cₐₜₛ = (C · (2.51 · C + 0.03)) / (C · (2.43 · C + 0.59) + 0.14)
-    // Maps HDR values to [0, 1] with a cinematic S-curve.
-    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // EQUATION 11: Procedural Foam Generation
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    // Gamma correction (sRGB output)
-    color = pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+    // ━─ Factor 1: Wave steepness ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // The vertex shader computes |∇y| from the summed Gerstner height
+    // derivatives. Large values mean a locally steep/breaking surface.
+    float foamSteep = smoothstep(
+      uFoamSteepnessThreshold,
+      uFoamSteepnessThreshold + (1.0 / uFoamSteepnessSharpness),
+      vWaveGradient
+    );
 
-    gl_FragColor = vec4(color, 1.0);
+    // ━─ Factor 2: Crest elevation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // Normalise elevation by the sum of amplitudes. This keeps foam stable
+    // if the wave set changes scale.
+    float crestHeight = clamp(vElevation / max(uMaxWaveHeight, 0.001), 0.0, 1.0);
+    float foamCrest = smoothstep(0.45, 0.78, crestHeight);
+
+    // Crest foam favours high water that is also steep. Very steep water
+    // can still produce sparse breaking foam even slightly below the crest.
+    float foamCrests = foamCrest * (0.35 + 0.65 * foamSteep);
+    float foamBreaking = pow(foamSteep, 3.0) * 0.45;
+    float foamCrestDebug = max(foamCrests, foamBreaking);
+
+    // ━─ Factor 3: Shoreline foam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // Distance from the mesh boundary plus optional circular shoreline
+    // fields for islands/sandbars.
+    float foamShore = 0.0;
+    if (uShorelineFoamWidth > 0.0) {
+      vec2 absPos = abs(vWorldPosition.xz);
+      float distX = uMeshHalfSize - absPos.x;
+      float distZ = uMeshHalfSize - absPos.z;
+      float distEdge = min(distX, distZ);
+      foamShore = (1.0 - smoothstep(0.0, uShorelineFoamWidth, distEdge))
+                  * uShorelineFoamOpacity;
+    }
+
+    for (int i = 0; i < ${MAX_SHORELINE_SOURCES}; i++) {
+      if (i >= uShorelineSourceCount) break;
+
+      vec4 src = uShorelineSources[i];
+      float band = circularBand(vWorldPosition.xz, src.xy, src.z, src.w);
+      foamShore = max(foamShore, band * uShorelineFoamOpacity);
+    }
+
+    // ━─ Factor 4: Object Intersection Foam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // For each foam source, compute distance and create a ring of foam
+    // just outside the object boundary.
+    float foamObject = 0.0;
+    for (int i = 0; i < ${MAX_FOAM_SOURCES}; i++) {
+      if (i >= uFoamSourceCount) break;
+
+      vec4 src = uFoamSources[i];
+      foamObject = max(
+        foamObject,
+        circularBand(vWorldPosition.xz, src.xy, src.z, src.w)
+      );
+    }
+
+    // ━─ Compose foam factors ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // Take the maximum of all independent foam sources.
+    // This ensures the strongest foam signal wins at each pixel.
+    float foamBase = max(max(foamCrests, foamBreaking), max(foamShore, foamObject));
+
+    // ━─ Noise Modulation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // Domain-warped fBM breaks up the analytical masks without requiring
+    // a painted foam texture.
+    vec2 windDrift = normalize(vec2(0.8, 0.35)) * uTime * 0.08;
+    vec2 foamUV = vWorldPosition.xz * uFoamNoiseFrequency * 0.08 + windDrift;
+    foamUV += vec2(uFoamNoiseSeed, uFoamNoiseSeed * 1.37);
+
+    vec2 warp = vec2(
+      foamFBM(foamUV + 17.0),
+      foamFBM(foamUV - 29.0)
+    ) - 0.5;
+
+    float breakup = foamFBM(foamUV + warp * 1.75);
+    float lace = smoothstep(0.28, 0.86, breakup);
+
+    // Strong masks remain continuous; weak masks become broken, lacy foam.
+    float noiseMod = mix(0.25 + 0.75 * lace, 1.0, smoothstep(0.65, 1.0, foamBase));
+    float foamFinal = foamBase * noiseMod;
+
+    // Clamp to maximum opacity
+    foamFinal = clamp(foamFinal, 0.0, uFoamMaxOpacity);
+
+    if (uDebugMode == 5) {
+      gl_FragColor = vec4(vec3(clamp(foamCrestDebug, 0.0, 1.0)), 1.0);
+      return;
+    }
+
+    if (uDebugMode == 6) {
+      gl_FragColor = vec4(vec3(clamp(foamShore, 0.0, 1.0)), 1.0);
+      return;
+    }
+
+    if (uDebugMode == 7) {
+      gl_FragColor = vec4(vec3(clamp(foamObject, 0.0, 1.0)), 1.0);
+      return;
+    }
+
+    if (uDebugMode == 8) {
+      gl_FragColor = vec4(vec3(foamFinal), 1.0);
+      return;
+    }
+
+    // ━─ Apply foam to colour ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // Blend between water colour and foam colour.  Using mix() ensures
+    // foam replaces the water colour rather than adding to it.
+    vec3 color = mix(waterColor, uFoamColor, foamFinal);
+
+    gl_FragColor = vec4(tonemapACES(color), 1.0);
   }
 `;
 
@@ -779,6 +1142,7 @@ function normalizeDirection2(d: [number, number]): [number, number] {
 
 export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
   private _timeUniform: { value: number };
+  private _debugModeUniform: { value: number };
 
   constructor(config: Partial<WaterMeshConfig> = {}) {
     const resolved: WaterMeshConfig = { ...defaultConfig, ...config };
@@ -801,6 +1165,7 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
     const speedArr: number[] = [];
     const directionArr: number[] = []; // interleaved dx, dz
     const steepnessArr: number[] = [];
+    let maxWaveHeight = 0;
 
     for (let i = 0; i < waveCount; i++) {
       const w = waves[i];
@@ -811,6 +1176,7 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
       speedArr.push(w.speed);
       directionArr.push(dx, dz);
       steepnessArr.push(w.steepness);
+      maxWaveHeight += Math.abs(w.amplitude);
     }
 
     // Pad to MAX_WAVES with zeros
@@ -823,16 +1189,40 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
     }
 
     // -- PBR parameters ----------------------------------------------------
-    //
-    // F₀ (Schlick Fresnel at normal incidence) for water.
-    // Derived from the index of refraction:  F₀ = ((ior − 1) / (ior + 1))²
-    // With ior = 1.33 for water:  F₀ ≈ 0.023
     const ior = resolved.ior ?? 1.33;
     const f0Scalar = ((ior - 1) / (ior + 1)) ** 2;
     const f0 = [f0Scalar, f0Scalar, f0Scalar];
 
     const roughness = resolved.roughness ?? 0.15;
     const metalness = resolved.metalness ?? 0.0;
+
+    // -- Shoreline / object foam source arrays -----------------------------
+    const shorelineSources = resolved.shorelineFoamSources ?? [];
+    const shorelineSourceCount = Math.min(
+      shorelineSources.length,
+      MAX_SHORELINE_SOURCES
+    );
+
+    const shorelineSourceArr: Vector4[] = [];
+    for (let i = 0; i < shorelineSourceCount; i++) {
+      const src = shorelineSources[i];
+      shorelineSourceArr.push(new Vector4(src[0], src[1], src[2], src[3]));
+    }
+    while (shorelineSourceArr.length < MAX_SHORELINE_SOURCES) {
+      shorelineSourceArr.push(new Vector4(0, 0, 0, 0));
+    }
+
+    const foamSources = resolved.objectFoamSources ?? [];
+    const foamSourceCount = Math.min(foamSources.length, MAX_FOAM_SOURCES);
+
+    const foamSourceArr: Vector4[] = [];
+    for (let i = 0; i < foamSourceCount; i++) {
+      const src = foamSources[i];
+      foamSourceArr.push(new Vector4(src[0], src[1], src[2], src[3]));
+    }
+    while (foamSourceArr.length < MAX_FOAM_SOURCES) {
+      foamSourceArr.push(new Vector4(0, 0, 0, 0));
+    }
 
     // -- Material ----------------------------------------------------------
     const material = new ShaderMaterial({
@@ -846,6 +1236,7 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
         uSpeed: { value: speedArr },
         uDirection: { value: directionArr },
         uSteepness: { value: steepnessArr },
+        uMaxWaveHeight: { value: Math.max(maxWaveHeight, 0.001) },
 
         // PBR uniforms
         uRoughness: { value: roughness },
@@ -856,6 +1247,7 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
         uEnvMap: { value: resolved.envMap || null },
         uIrradianceMap: { value: resolved.irradianceMap || null },
         uBRDFLUT: { value: resolved.brdfLUT || null },
+        uDebugMode: { value: 0 },
 
         // Water appearance uniforms
         uDeepColor: {
@@ -871,11 +1263,38 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
         uFoamColor: {
           value: new Vector3(...(resolved.foamColor ?? [0.95, 0.95, 0.95])),
         },
-        uFoamThreshold: { value: resolved.foamThreshold ?? 2.5 },
         uSSSColor: {
           value: new Vector3(...(resolved.sssColor ?? [0.0, 0.35, 0.45])),
         },
         uSSSScale: { value: resolved.sssScale ?? 8.0 },
+
+        // Foam uniforms
+        uFoamSteepnessThreshold: {
+          value: resolved.foamSteepnessThreshold ?? 0.3,
+        },
+        uFoamSteepnessSharpness: {
+          value: resolved.foamSteepnessSharpness ?? 8.0,
+        },
+        uShorelineFoamWidth: {
+          value: resolved.shorelineFoamWidth ?? 8.0,
+        },
+        uShorelineFoamOpacity: {
+          value: resolved.shorelineFoamOpacity ?? 0.6,
+        },
+        uFoamNoiseSeed: {
+          value: resolved.foamNoiseSeed ?? 42.0,
+        },
+        uFoamNoiseFrequency: {
+          value: resolved.foamNoiseFrequency ?? 3.0,
+        },
+        uFoamMaxOpacity: {
+          value: resolved.foamMaxOpacity ?? 0.7,
+        },
+        uMeshHalfSize: { value: resolved.size / 2 },
+        uShorelineSourceCount: { value: shorelineSourceCount },
+        uShorelineSources: { value: shorelineSourceArr },
+        uFoamSourceCount: { value: foamSourceCount },
+        uFoamSources: { value: foamSourceArr },
       },
       side: DoubleSide,
       lights: false, // We handle lighting manually in the shader
@@ -884,6 +1303,7 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
     super(geometry, material);
 
     this._timeUniform = material.uniforms.uTime;
+    this._debugModeUniform = material.uniforms.uDebugMode;
 
     // Y = 0 is the water surface.
     this.position.y = 0;
@@ -894,5 +1314,9 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
    */
   update(time: number): void {
     this._timeUniform.value = time;
+  }
+
+  setDebugMode(mode: number): void {
+    this._debugModeUniform.value = mode;
   }
 }
