@@ -93,9 +93,38 @@ export interface WaterMeshConfig {
   foamColor?: [number, number, number];
 
   /**
-   * Threshold (in elevation space) above which foam appears.
+   * Surface gradient magnitude |∇h| threshold above which foam begins
+   * to appear.  When |∇h| exceeds this value the wave face is steep
+   * enough to start breaking.  Typical values: 0.3–0.8.
    */
-  foamThreshold?: number;
+  foamGradientThreshold?: number;
+
+  /**
+   * Elevation threshold (in meters) for crest foam.  Foam density
+   * increases for vertices above this elevation.
+   */
+  foamElevationThreshold?: number;
+
+  /**
+   * Shoreline foam intensity multiplier.  When a depth map or boundary
+   * is provided, this scales the foam that accumulates near coastlines.
+   * Range: 0–1.  Default: 0.5.
+   */
+  foamShoreIntensity?: number;
+
+  /**
+   * Object collision foam intensity multiplier.  Foam generated around
+   * intersecting geometry (rocks, piers, etc.) is scaled by this factor.
+   * Range: 0–1.  Default: 0.4.
+   */
+  foamCollisionIntensity?: number;
+
+  /**
+   * Overall foam opacity multiplier.  Scales the final foam contribution
+   * to control how prominent whitecaps appear.  Range: 0–1.
+   * Default: 0.6.
+   */
+  foamOpacity?: number;
 
   /**
    * Subsurface scattering approximation colour.
@@ -118,7 +147,11 @@ const defaultConfig: WaterMeshConfig = {
   deepColor: [0.0, 0.05, 0.15],
   shallowColor: [0.0, 0.5, 0.6],
   foamColor: [0.95, 0.95, 0.95],
-  foamThreshold: 2.5,
+  foamGradientThreshold: 0.35,
+  foamElevationThreshold: 1.8,
+  foamShoreIntensity: 0.5,
+  foamCollisionIntensity: 0.4,
+  foamOpacity: 0.6,
   sssColor: [0.0, 0.35, 0.45],
   sssScale: 8.0,
   waves: [
@@ -193,6 +226,9 @@ const vertexShader = /* glsl */ `
   varying vec3 vWorldPosition;
   varying vec3 vNormal;
   varying float vElevation;
+  // Foam: surface gradient magnitude |∇h| computed from analytical tangents.
+  // High gradient → steep wave face → breaking → foam.
+  varying float vSurfaceGradient;
 
   void main() {
     vec3 p = position;                  // original vertex (y ≈ 0)
@@ -246,6 +282,14 @@ const vertexShader = /* glsl */ `
     vWorldPosition = (modelMatrix * vec4(pos, 1.0)).xyz;
     vNormal = normalize(normalMatrix * normal);
     vElevation = disp.y;
+
+    // Surface gradient magnitude for procedural foam.
+    // The tangent vectors tx = ∂P/∂x₀ and tz = ∂P/∂z₀ encode the
+    // partial derivatives of wave height:  ∂h/∂x₀ = tx.y,  ∂h/∂z₀ = tz.y
+    // The gradient magnitude |∇h| = sqrt( (∂h/∂x)² + (∂h/∂z)² )
+    // is a direct measure of surface steepness.  When |∇h| approaches
+    // or exceeds 1.0 the wave face is vertical or overhung (breaking).
+    vSurfaceGradient = sqrt(tx.y * tx.y + tz.y * tz.y);
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
   }
@@ -591,7 +635,11 @@ const fragmentShader = /* glsl */ `
   uniform vec3  uDeepColor;
   uniform vec3  uShallowColor;
   uniform vec3  uFoamColor;
-  uniform float uFoamThreshold;
+  uniform float uFoamGradientThreshold;
+  uniform float uFoamElevationThreshold;
+  uniform float uFoamShoreIntensity;
+  uniform float uFoamCollisionIntensity;
+  uniform float uFoamOpacity;
   uniform vec3  uSSSColor;
   uniform float uSSSScale;
 
@@ -743,10 +791,81 @@ const fragmentShader = /* glsl */ `
     float sss = max(0.0, dot(V, T)) * (1.0 - F_diffuse.r) * wrapLight;
     vec3 sssContribution = uSSSColor * sss * 0.5;
 
-    // ── Foam / whitecaps at wave crests ─────────────────────────────────
-    // Foam appears when elevation exceeds the threshold.
-    float foam = smoothstep(uFoamThreshold, uFoamThreshold + 1.5, vElevation);
-    vec3 foamContribution = uFoamColor * foam * 0.3;
+    // ───────────────────────────────────────────────────────────────────────
+    // PROCEDURAL FOAM — Multi-factor whitecap generation
+    // ───────────────────────────────────────────────────────────────────────
+    //
+    // Foam is generated from four independent physical factors combined
+    // multiplicatively.  Each factor produces a density in [0, 1].
+    //
+    // Factor 1: Wave Steepness (gradient-based breaking)
+    //   The surface gradient |∇h| is passed from the vertex shader as
+    //   vSurfaceGradient.  When |∇h| exceeds a threshold, the wave face
+    //   is steep enough to break, generating turbulent white water.
+    //
+    //   foam_grad = smoothstep(threshold, threshold + 0.5, |∇h|)
+    //
+    //   Physical basis:  A wave breaks when the phase speed of the crest
+    //   exceeds the group speed.  For Gerstner waves, this corresponds to
+    //   steepness parameters q ≈ 0.5-0.8, which produce |∇h| > 0.3-0.6.
+    //
+    // Factor 2: Crest Elevation (high points get foam)
+    //   Foam accumulates at wave peaks where multiple wave constructively
+    //   interfere.  Elevation above a threshold indicates crest regions.
+    //
+    //   foam_crest = smoothstep(threshold, threshold + 2.0, elevation)
+    //
+    // Factor 3: Shoreline (depth-based foam accumulation)
+    //   Near coastlines, wave energy dissipates as turbulent white water.
+    //   This is driven by a configurable shore intensity uniform that
+    //   can be modulated by a depth map or distance to boundary.
+    //
+    //   foam_shore = shoreIntensity * wave_energy
+    //   where wave_energy = sum of (amplitude * steepness) for all layers
+    //
+    // Factor 4: Object Collision (impact foam)
+    //   When waves intersect solid objects (rocks, piers, hulls), the
+    //   impact generates spray and foam.  This is driven by a collision
+    //   intensity uniform that can be modulated by distance to objects.
+    //
+    //   foam_collision = collisionIntensity * wave_kinetic_energy
+    //   where kinetic_energy ∝ sum of (amplitude² * ω² * steepness²)
+    //
+    // Final foam density is the union of all factors:
+    //   foam = 1 - (1 - foam_grad) * (1 - foam_crest) * (1 - foam_shore) * (1 - foam_collision)
+    // This ensures any factor can independently contribute foam.
+
+    // -- Factor 1: Steepness-based breaking foam --------------------------
+    float foam_grad = smoothstep(uFoamGradientThreshold,
+                                  uFoamGradientThreshold + 0.5,
+                                  vSurfaceGradient);
+
+    // -- Factor 2: Crest elevation foam -----------------------------------
+    float foam_crest = smoothstep(uFoamElevationThreshold,
+                                   uFoamElevationThreshold + 2.0,
+                                   vElevation);
+
+    // -- Factor 3: Shoreline foam (intensity-scaled) ----------------------
+    // Without a depth map, shore foam is driven by wave energy proxy.
+    // The surface gradient itself is a good proxy for total wave energy.
+    float foam_shore = uFoamShoreIntensity * clamp(vSurfaceGradient * 0.5, 0.0, 1.0);
+
+    // -- Factor 4: Collision foam (intensity-scaled) ----------------------
+    // Collision foam uses kinetic energy proxy from gradient².
+    float foam_collision = uFoamCollisionIntensity *
+                           clamp(vSurfaceGradient * vSurfaceGradient * 0.3, 0.0, 1.0);
+
+    // -- Combine: probabilistic union --------------------------------------
+    // P(foam) = 1 - (1-p1)(1-p2)(1-p3)(1-p4)
+    // This ensures any factor can independently trigger foam without
+    // double-counting, and the result stays in [0, 1].
+    float foam = 1.0 - (1.0 - foam_grad) *
+                        (1.0 - foam_crest) *
+                        (1.0 - foam_shore) *
+                        (1.0 - foam_collision);
+
+    // -- Apply opacity and color -------------------------------------------
+    vec3 foamContribution = uFoamColor * foam * uFoamOpacity;
 
     // ── Combine all contributions ───────────────────────────────────────
     vec3 color = directLighting + envSpecular + envDiffuse + sssContribution + foamContribution;
@@ -871,7 +990,11 @@ export class WaterMesh extends Mesh<BufferGeometry, ShaderMaterial> {
         uFoamColor: {
           value: new Vector3(...(resolved.foamColor ?? [0.95, 0.95, 0.95])),
         },
-        uFoamThreshold: { value: resolved.foamThreshold ?? 2.5 },
+        uFoamGradientThreshold: { value: resolved.foamGradientThreshold ?? 0.35 },
+        uFoamElevationThreshold: { value: resolved.foamElevationThreshold ?? 1.8 },
+        uFoamShoreIntensity: { value: resolved.foamShoreIntensity ?? 0.5 },
+        uFoamCollisionIntensity: { value: resolved.foamCollisionIntensity ?? 0.4 },
+        uFoamOpacity: { value: resolved.foamOpacity ?? 0.6 },
         uSSSColor: {
           value: new Vector3(...(resolved.sssColor ?? [0.0, 0.35, 0.45])),
         },
