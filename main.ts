@@ -1,0 +1,217 @@
+import * as THREE from 'three';
+import { PMREMGenerator } from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { WaterMesh } from './water/WaterMesh.js';
+
+// ---------------------------------------------------------------------------
+// Procedural HDR sky scene for environment map generation
+// ---------------------------------------------------------------------------
+//
+// We build a small scene with a gradient sky shader and a sun, then run
+// PMREMGenerator to produce a prefiltered CubeTexture.  This CubeTexture
+// is what the water shader samples for reflections.
+//
+// PMREM (Pre-Filtered Multi-Resolution Environment Map) convolves the
+// source environment into a mip chain where each level represents the
+// integral of a GGX lobe at increasing roughness.  This is exactly what
+// the Cook-Torrance BRDF needs for rough reflections.
+//
+// Additionally, PMREMGenerator can produce an irradiance map from the
+// same scene.  The irradiance map is a spherical convolution of the
+// environment that provides diffuse (ambient) lighting for the
+// Fresnel-weighted diffuse term.
+
+function createProceduralSkyScene(): THREE.Scene {
+  const skyScene = new THREE.Scene();
+
+  // Sky dome with a gradient shader
+  const skyGeo = new THREE.SphereGeometry(500, 32, 32);
+  skyGeo.rotateX(-Math.PI / 2);
+
+  const skyMat = new THREE.ShaderMaterial({
+    vertexShader: /* glsl */ `
+      varying vec3 vWorldPosition;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = wp.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying vec3 vWorldPosition;
+      uniform vec3 uSunDirection;
+
+      void main() {
+        vec3 dir = normalize(vWorldPosition);
+        float y = dir.y;
+
+        // Sky gradient: horizon → zenith
+        vec3 horizonColor = vec3(0.6, 0.75, 0.9);
+        vec3 zenithColor  = vec3(0.1, 0.2, 0.6);
+        vec3 skyColor = mix(horizonColor, zenithColor, max(y, 0.0));
+
+        // Below horizon: ground colour
+        vec3 groundColor = vec3(0.05, 0.08, 0.12);
+        skyColor = mix(skyColor, groundColor, smoothstep(0.0, -0.1, y));
+
+        // Sun disc
+        float sunDot = max(dot(dir, uSunDirection), 0.0);
+        float sun = pow(sunDot, 256.0) * 5.0;
+
+        // Sun glow
+        float glow = pow(sunDot, 16.0) * 0.5;
+
+        skyColor += sun + glow;
+
+        gl_FragColor = vec4(skyColor, 1.0);
+      }
+    `,
+    uniforms: {
+      uSunDirection: {
+        value: new THREE.Vector3(0.5, 1.0, 0.3).normalize(),
+      },
+    },
+    side: THREE.BackSide,
+    depthWrite: false,
+  });
+
+  const skyMesh = new THREE.Mesh(skyGeo, skyMat);
+  skyScene.add(skyMesh);
+
+  // Place a camera at the origin pointing up — PMREMGenerator will
+  // render the six cube faces from this position.
+  const camera = new THREE.PerspectiveCamera(90, 1, 0.1, 1000);
+  camera.position.set(0, 0, 0);
+  skyScene.add(camera);
+
+  return skyScene;
+}
+
+// ---------------------------------------------------------------------------
+// Scene, camera, renderer
+// ---------------------------------------------------------------------------
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a1520);
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  5000
+);
+camera.position.set(0, 50, 120);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.NoToneMapping; // We tone-map in the shader
+document.body.appendChild(renderer.domElement);
+
+// ---------------------------------------------------------------------------
+// Generate HDR environment maps
+// ---------------------------------------------------------------------------
+//
+// Two maps are generated from the procedural sky scene:
+//
+// 1. envMap (prefiltered):  The PMREM prefiltered CubeTexture with a
+//    mip chain for roughness-based reflection blur.  This is sampled
+//    in the specular path with textureLod().
+//
+// 2. irradianceMap:  A spherical convolution of the environment that
+//    provides diffuse ambient lighting.  This is sampled in the diffuse
+//    path and weighted by (1 - Fresnel) for energy conservation.
+//
+// The PMREMGenerator.fromScene() method produces both maps internally.
+// The .texture property is the prefiltered map, and we can extract the
+// irradiance map from the generator's internal state.
+
+const skyScene = createProceduralSkyScene();
+
+const pmremGenerator = new PMREMGenerator(renderer);
+pmremGenerator.compileEquirectangularShader();
+
+// Generate the PMREM texture from our procedural sky scene.
+// The result is a CubeTexture with a prefiltered mip chain.
+const envMap: THREE.CubeTexture = pmremGenerator.fromScene(skyScene).texture;
+
+// Generate the irradiance map for diffuse environment lighting.
+// PMREMGenerator stores the irradiance map internally after fromScene().
+// The second fromScene call with a small blur radius produces the diffuse map.
+const irradianceMap = pmremGenerator.fromScene(skyScene, 0.04).texture as THREE.CubeTexture;
+
+// Clean up — we no longer need the generator or sky scene.
+pmremGenerator.dispose();
+skyScene.children.forEach((child) => {
+  if (child instanceof THREE.Mesh) {
+    child.geometry.dispose();
+    if (Array.isArray(child.material)) {
+      child.material.forEach((m) => m.dispose());
+    } else {
+      child.material.dispose();
+    }
+  }
+});
+
+// Set the env map on the main scene so standard materials can use it too.
+scene.environment = envMap;
+
+// ---------------------------------------------------------------------------
+// Ocean mesh
+// ---------------------------------------------------------------------------
+
+const water = new WaterMesh({
+  size: 1000,
+  segments: 256,
+  envMap,
+  irradianceMap,
+  roughness: 0.15,
+  metalness: 0.0,
+  ior: 1.33,
+  deepColor: [0.0, 0.05, 0.15],
+  shallowColor: [0.0, 0.5, 0.6],
+  foamColor: [0.95, 0.95, 0.95],
+  foamThreshold: 2.5,
+  sssColor: [0.0, 0.35, 0.45],
+  sssScale: 8.0,
+});
+scene.add(water);
+
+// ---------------------------------------------------------------------------
+// Orbit controls
+// ---------------------------------------------------------------------------
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.maxPolarAngle = Math.PI;
+controls.minDistance = 10;
+controls.maxDistance = 800;
+
+// ---------------------------------------------------------------------------
+// Resize handler
+// ---------------------------------------------------------------------------
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------------------------------------------------------------------------
+// Animation loop
+// ---------------------------------------------------------------------------
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const elapsed = clock.getElapsedTime();
+  water.update(elapsed);
+  controls.update();
+
+  renderer.render(scene, camera);
+}
+
+animate();
