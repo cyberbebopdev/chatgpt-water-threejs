@@ -98,6 +98,40 @@ export interface WaterMeshConfig {
   foamThreshold?: number;
 
   /**
+   * Divergence threshold for wave-breaking detection.
+   * When the accumulated horizontal velocity divergence exceeds this
+   * value, foam is generated.  Higher values mean less breaking foam.
+   * Typical range: 0.01 – 0.2.
+   */
+  foamBreakingThreshold?: number;
+
+  /**
+   * Spatial frequency of the procedural foam noise.
+   * Larger values produce smaller, denser foam cells.
+   * Typical range: 2 – 20.
+   */
+  foamNoiseScale?: number;
+
+  /**
+   * Drift speed of the foam noise pattern (world units/sec).
+   * Creates the illusion of foam being advected by currents.
+   * Typical range: 0.5 – 5.
+   */
+  foamNoiseDrift?: number;
+
+  /**
+   * Distance to the nearest shoreline (world units).
+   * When set, foam accumulates within `shoreFoamWidth` meters of
+   * the shore boundary.  Omit or set to Infinity to disable.
+   */
+  shoreDistance?: number;
+
+  /**
+   * Width of the foam band along the shoreline.
+   */
+  shoreFoamWidth?: number;
+
+  /**
    * Subsurface scattering approximation colour.
    * Simulates light that penetrates the surface and exits nearby.
    */
@@ -119,6 +153,11 @@ const defaultConfig: WaterMeshConfig = {
   shallowColor: [0.0, 0.5, 0.6],
   foamColor: [0.95, 0.95, 0.95],
   foamThreshold: 2.5,
+  foamBreakingThreshold: 0.08,
+  foamNoiseScale: 8.0,
+  foamNoiseDrift: 2.0,
+  shoreDistance: Infinity,
+  shoreFoamWidth: 3.0,
   sssColor: [0.0, 0.35, 0.45],
   sssScale: 8.0,
   waves: [
@@ -193,6 +232,7 @@ const vertexShader = /* glsl */ `
   varying vec3 vWorldPosition;
   varying vec3 vNormal;
   varying float vElevation;
+  varying float vBreaking;       // accumulated wave-breaking divergence
 
   void main() {
     vec3 p = position;                  // original vertex (y ≈ 0)
@@ -203,6 +243,7 @@ const vertexShader = /* glsl */ `
     vec3 tz = vec3(0.0, 0.0, 1.0);     // ∂P/∂z₀
 
     vec3 disp = vec3(0.0);
+    float breaking = 0.0;          // wave-breaking divergence accumulator
 
     for (int i = 0; i < ${MAX_WAVES}; i++) {
       if (i >= uWaveCount) break;
@@ -225,11 +266,23 @@ const vertexShader = /* glsl */ `
       disp.y +=  A * cp;
       disp.z += -A * q * sp * d.y;
 
-      // -- Analytical tangent contributions -------------------------------
-      // ∂φ/∂x₀ = k * d.x ,  ∂φ/∂z₀ = k * d.y  (d.y is dz)
-      float aqk = A * q * k;
+       // -- Analytical tangent contributions -------------------------------
+       // ∂φ/∂x₀ = k * d.x ,  ∂φ/∂z₀ = k * d.y  (d.y is dz)
+       float aqk = A * q * k;
 
-      tx.x += -aqk * d.x * d.x * cp;
+       // -- Wave breaking divergence ----------------------------------------
+       // The horizontal velocity of a Gerstner wave is:
+       //   v = (A*q*v*dₖ*cos(φ))  in propagation direction d
+       // The 2D divergence ∇·v (compression) is:
+       //   ∇·v = -A*q*k²*cos(φ)
+       // Positive divergence means expansion (troughs), negative means
+       // compression (crests).  We accumulate max(0, -div) so that
+       // compression zones produce a positive breaking signal.
+       // This is the key insight: foam forms where waves compress and break.
+       float k2 = k * k;
+       breaking += max(0.0, -A * q * k2 * cp);
+
+       tx.x += -aqk * d.x * d.x * cp;
       tx.y += -A * k * d.x * sp;
       tx.z += -aqk * d.x * d.y * cp;
 
@@ -246,6 +299,7 @@ const vertexShader = /* glsl */ `
     vWorldPosition = (modelMatrix * vec4(pos, 1.0)).xyz;
     vNormal = normalize(normalMatrix * normal);
     vElevation = disp.y;
+    vBreaking = breaking;
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
   }
@@ -576,6 +630,7 @@ const fragmentShader = /* glsl */ `
   varying vec3 vWorldPosition;
   varying vec3 vNormal;
   varying float vElevation;
+  varying float vBreaking;
 
   // ── PBR uniforms ──────────────────────────────────────────────────────
   uniform float uRoughness;
@@ -586,6 +641,7 @@ const fragmentShader = /* glsl */ `
   uniform samplerCube uEnvMap;    // PMREM-processed environment map
   uniform samplerCube uIrradianceMap;  // irradiance for diffuse env
   uniform sampler2D uBRDFLUT;     // precomputed BRDF lookup (optional)
+  uniform float uTime;
 
   // ── Water appearance uniforms ─────────────────────────────────────────
   uniform vec3  uDeepColor;
@@ -595,8 +651,53 @@ const fragmentShader = /* glsl */ `
   uniform vec3  uSSSColor;
   uniform float uSSSScale;
 
+  // ── Procedural foam uniforms ──────────────────────────────────────────
+  uniform float uFoamBreakingThreshold;  // divergence threshold for breaking
+  uniform float uFoamNoiseScale;         // spatial frequency of foam noise
+  uniform float uFoamNoiseDrift;         // drift speed of foam pattern
+  uniform float uShoreDistance;          // distance to shoreline (Infinity to disable)
+  uniform float uShoreFoamWidth;         // width of shoreline foam band
+
   // ── Constants ─────────────────────────────────────────────────────────
   const float PI = 3.141592653589793;
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Procedural value noise for foam pattern
+  // Hash-based noise with smooth interpolation — no textures required.
+  // Produces a cellular / cellular-foam pattern when thresholded.
+  // ───────────────────────────────────────────────────────────────────────
+  // Hash function: maps a 2D coordinate to a pseudo-random float in [0, 1]
+  float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+  }
+
+  // Smooth value noise: bilinearly interpolates hash values at grid corners
+  float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    // Smoothstep for C1 continuity
+    vec2 u = f * f * (3.0 - 2.0 * f);
+
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+  }
+
+  // Foam noise: combines two octaves of value noise for a cellular pattern.
+  // The noise is advected by time * drift to simulate foam movement.
+  float foamNoise(vec2 pos, float time, float scale, float drift) {
+    // First octave — large-scale foam patches
+    vec2 p1 = pos * scale / 100.0 + vec2(drift * 0.3, drift * 0.1) * time;
+    float n1 = noise(p1);
+    // Second octave — finer detail, higher frequency
+    vec2 p2 = pos * scale / 50.0 + vec2(-drift * 0.1, drift * 0.4) * time;
+    float n2 = noise(p2);
+    // Combine: average the two octaves, then sharpen with smoothstep
+    return smoothstep(0.2, 0.8, (n1 * 0.6 + n2 * 0.4));
+  }
 
   // ───────────────────────────────────────────────────────────────────────
   // EQUATION 1: Schlick Fresnel Approximation
@@ -743,10 +844,37 @@ const fragmentShader = /* glsl */ `
     float sss = max(0.0, dot(V, T)) * (1.0 - F_diffuse.r) * wrapLight;
     vec3 sssContribution = uSSSColor * sss * 0.5;
 
-    // ── Foam / whitecaps at wave crests ─────────────────────────────────
-    // Foam appears when elevation exceeds the threshold.
-    float foam = smoothstep(uFoamThreshold, uFoamThreshold + 1.5, vElevation);
-    vec3 foamContribution = uFoamColor * foam * 0.3;
+    // ── Procedural foam / whitecaps ─────────────────────────────────────
+    // Multi-factor foam: foamAmount = crestFactor * breakingFactor * noiseMask
+    //
+    // Factor 1 — Crest elevation: foam only appears near wave crests.
+    // Factor 2 — Wave breaking: foam is stronger where waves compress
+    //   (positive horizontal velocity divergence from the vertex shader).
+    // Factor 3 — Procedural noise: masks the foam with a cellular pattern
+    //   so it looks like organic foam patches rather than a smooth gradient.
+    // Factor 4 — Shoreline: additional foam near the shore boundary.
+
+    // Crest factor: smooth transition from no foam to full foam at crests
+    float crestFactor = smoothstep(uFoamThreshold - 1.0, uFoamThreshold + 1.0, vElevation);
+
+    // Breaking factor: how much the wave is compressing (from vertex shader)
+    float breakingFactor = clamp(vBreaking / uFoamBreakingThreshold, 0.0, 1.0);
+
+    // Noise mask: procedural cellular pattern, advected over time
+    float n = foamNoise(vWorldPosition.xz, uTime, uFoamNoiseScale, uFoamNoiseDrift);
+
+    // Shoreline foam: smooth band near the shore boundary
+    float shoreFactor = 0.0;
+    if (uShoreDistance < 10000.0) {
+      float distToShore = abs(length(vWorldPosition.xz) - uShoreDistance);
+      shoreFactor = 1.0 - smoothstep(0.0, uShoreFoamWidth, distToShore);
+    }
+
+    // Combine: foam needs crest AND (breaking OR shore), masked by noise
+    float foamAmount = crestFactor * max(breakingFactor, shoreFactor) * n;
+
+    // Foam contribution: blend foam color over the water color
+    vec3 foamContribution = uFoamColor * foamAmount * 0.8;
 
     // ── Combine all contributions ───────────────────────────────────────
     vec3 color = directLighting + envSpecular + envDiffuse + sssContribution + foamContribution;
